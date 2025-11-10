@@ -11,6 +11,8 @@
 (define-constant err-unauthorized (err u107))
 (define-constant err-payment-failed (err u108))
 (define-constant err-already-filled (err u109))
+(define-constant err-invalid-decay-rate (err u110))
+(define-constant err-invalid-decay-interval (err u111))
 
 (define-data-var listing-nonce uint u0)
 (define-data-var transaction-nonce uint u0)
@@ -47,7 +49,9 @@
         filled: bool,
         buyer: (optional principal),
         created-at: uint,
-        filled-at: (optional uint)
+        filled-at: (optional uint),
+        decay-rate: uint,
+        decay-interval: uint
     }
 )
 
@@ -134,7 +138,46 @@
             filled: false,
             buyer: none,
             created-at: stacks-block-height,
-            filled-at: none
+            filled-at: none,
+            decay-rate: u0,
+            decay-interval: u0
+        })
+        
+        (var-set listing-nonce (+ current-nonce u1))
+        (ok current-nonce)
+    )
+)
+
+(define-public (create-listing-with-decay (energy-amount uint) (price-per-unit uint) (decay-rate uint) (decay-interval uint))
+    (let
+        (
+            (caller tx-sender)
+            (producer-data (unwrap! (map-get? producers caller) err-not-registered))
+            (current-nonce (var-get listing-nonce))
+            (total-price (* energy-amount price-per-unit))
+        )
+        (asserts! (> energy-amount u0) err-invalid-amount)
+        (asserts! (> price-per-unit u0) err-invalid-price)
+        (asserts! (>= (get balance producer-data) energy-amount) err-insufficient-energy)
+        (asserts! (get active producer-data) err-unauthorized)
+        (asserts! (<= decay-rate u100) err-invalid-decay-rate)
+        (asserts! (> decay-interval u0) err-invalid-decay-interval)
+        
+        (map-set producers caller (merge producer-data {
+            balance: (- (get balance producer-data) energy-amount)
+        }))
+        
+        (map-set energy-listings current-nonce {
+            producer: caller,
+            energy-amount: energy-amount,
+            price-per-unit: price-per-unit,
+            total-price: total-price,
+            filled: false,
+            buyer: none,
+            created-at: stacks-block-height,
+            filled-at: none,
+            decay-rate: decay-rate,
+            decay-interval: decay-interval
         })
         
         (var-set listing-nonce (+ current-nonce u1))
@@ -150,11 +193,13 @@
             (consumer-data (unwrap! (map-get? consumers caller) err-not-registered))
             (producer-data (unwrap! (map-get? producers (get producer listing)) err-not-registered))
             (current-tx-nonce (var-get transaction-nonce))
+            (current-price (unwrap-panic (calculate-current-price listing-id)))
+            (actual-total-price (* (get energy-amount listing) current-price))
         )
         (asserts! (not (get filled listing)) err-already-filled)
         (asserts! (get active consumer-data) err-unauthorized)
         
-        (unwrap! (stx-transfer? (get total-price listing) caller (get producer listing)) err-payment-failed)
+        (unwrap! (stx-transfer? actual-total-price caller (get producer listing)) err-payment-failed)
         
         (map-set energy-listings listing-id (merge listing {
             filled: true,
@@ -176,7 +221,7 @@
             seller: (get producer listing),
             buyer: caller,
             energy-amount: (get energy-amount listing),
-            total-price: (get total-price listing),
+            total-price: actual-total-price,
             timestamp: stacks-block-height
         })
         
@@ -260,4 +305,54 @@
 
 (define-read-only (get-transaction-count)
     (ok (var-get transaction-nonce))
+)
+
+(define-read-only (calculate-current-price (listing-id uint))
+    (let
+        (
+            (listing (unwrap! (map-get? energy-listings listing-id) err-listing-not-found))
+            (blocks-elapsed (- stacks-block-height (get created-at listing)))
+            (decay-rate (get decay-rate listing))
+            (decay-interval (get decay-interval listing))
+            (original-price (get price-per-unit listing))
+        )
+        (if (is-eq decay-rate u0)
+            (ok original-price)
+            (let
+                (
+                    (decay-periods (/ blocks-elapsed decay-interval))
+                    (total-decay-percentage (* decay-periods decay-rate))
+                    (capped-decay (if (> total-decay-percentage u100) u100 total-decay-percentage))
+                    (decay-amount (/ (* original-price capped-decay) u100))
+                    (new-price (if (> original-price decay-amount) (- original-price decay-amount) u1))
+                )
+                (ok new-price)
+            )
+        )
+    )
+)
+
+(define-read-only (get-dynamic-listing-info (listing-id uint))
+    (let
+        (
+            (listing (unwrap! (map-get? energy-listings listing-id) err-listing-not-found))
+            (current-price (unwrap-panic (calculate-current-price listing-id)))
+            (new-total-price (* (get energy-amount listing) current-price))
+        )
+        (ok {
+            listing-id: listing-id,
+            producer: (get producer listing),
+            energy-amount: (get energy-amount listing),
+            original-price-per-unit: (get price-per-unit listing),
+            current-price-per-unit: current-price,
+            original-total-price: (get total-price listing),
+            current-total-price: new-total-price,
+            filled: (get filled listing),
+            buyer: (get buyer listing),
+            created-at: (get created-at listing),
+            blocks-elapsed: (- stacks-block-height (get created-at listing)),
+            decay-rate: (get decay-rate listing),
+            decay-interval: (get decay-interval listing)
+        })
+    )
 )
